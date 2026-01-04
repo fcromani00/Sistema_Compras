@@ -461,10 +461,12 @@ def carregar_compras(_spreadsheet, _cache_key):
 
 
 def registrar_compra(spreadsheet, itens, metodo_pagamento, observacao=""):
-    """Registra uma nova compra com múltiplos itens e tratamento de erros"""
+    """Registra uma nova compra/venda com múltiplos itens, desconta do estoque e verifica alertas"""
     try:
-        ws = spreadsheet.worksheet('Compras')
-        dados = ws.get_all_values()
+        ws_compras = spreadsheet.worksheet('Compras')
+        ws_produtos = spreadsheet.worksheet('Produtos')
+        
+        dados = ws_compras.get_all_values()
         id_compra = f"CMP{len(dados):04d}"
         data_atual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
@@ -472,14 +474,21 @@ def registrar_compra(spreadsheet, itens, metodo_pagamento, observacao=""):
         metodo_pagamento = str(metodo_pagamento or "Não informado").strip()
         observacao = str(observacao or "").strip()
         
+        # Carrega dados dos produtos para atualizar estoque
+        produtos_dados = ws_produtos.get_all_records()
+        headers_produtos = ws_produtos.row_values(1)
+        col_estoque = headers_produtos.index('Estoque_Atual') + 1 if 'Estoque_Atual' in headers_produtos else None
+        
+        produtos_criticos = []
+        
         for item in itens:
             quantidade = float(item.get('quantidade', 0))
             preco = float(item.get('preco', 0))
             total = quantidade * preco
             produto = str(item.get('produto', '')).strip()
             
-            # Usa value_input_option='RAW' para salvar números corretamente
-            ws.append_row([
+            # Registra a venda na aba Compras
+            ws_compras.append_row([
                 id_compra,
                 data_atual,
                 produto,
@@ -489,11 +498,38 @@ def registrar_compra(spreadsheet, itens, metodo_pagamento, observacao=""):
                 metodo_pagamento,
                 observacao
             ], value_input_option='RAW')
+            
+            # Desconta do estoque do produto
+            if col_estoque:
+                for idx, prod in enumerate(produtos_dados, start=2):
+                    if prod.get('Nome') == produto:
+                        estoque_atual = float(prod.get('Estoque_Atual', 0) or 0)
+                        novo_estoque = max(0, estoque_atual - quantidade)  # Não deixa ficar negativo
+                        estoque_minimo = float(prod.get('Estoque_Minimo', 0) or 0)
+                        
+                        # Atualiza estoque na planilha
+                        ws_produtos.update_cell(idx, col_estoque, novo_estoque)
+                        
+                        # Verifica se ficou crítico
+                        if novo_estoque <= estoque_minimo:
+                            produtos_criticos.append({
+                                'Nome': produto,
+                                'Estoque_Atual': novo_estoque,
+                                'Estoque_Minimo': estoque_minimo
+                            })
+                        
+                        # Registra movimentação de saída
+                        try:
+                            registrar_movimentacao(spreadsheet, "Saída", produto, quantidade, "Venda", f"Compra {id_compra}")
+                        except:
+                            pass  # Não falha se não conseguir registrar movimentação
+                        
+                        break
         
-        return id_compra
+        return id_compra, produtos_criticos
     except Exception as e:
         st.error(f"❌ Erro ao registrar compra: {e}")
-        return None
+        return None, []
 
 
 # ==================== FUNÇÕES DE ESTOQUE ====================
@@ -1004,14 +1040,42 @@ def pagina_compras(spreadsheet):
                 observacao = st.text_input("Observação (opcional)")
                 
                 if st.button("✅ Finalizar Compra", use_container_width=True, type="primary"):
-                    id_compra = registrar_compra(spreadsheet, st.session_state.carrinho, metodo_pagamento, observacao)
-                    if id_compra:
+                    resultado = registrar_compra(spreadsheet, st.session_state.carrinho, metodo_pagamento, observacao)
+                    
+                    if resultado and resultado[0]:
+                        id_compra, produtos_criticos = resultado
+                        
                         st.success(f"🎉 Compra {id_compra} registrada com sucesso!")
+                        st.info("📦 Estoque atualizado automaticamente!")
+                        
+                        # Alerta de produtos críticos
+                        if produtos_criticos:
+                            st.warning(f"⚠️ **ATENÇÃO:** {len(produtos_criticos)} produto(s) ficaram com estoque crítico!")
+                            
+                            for prod in produtos_criticos:
+                                st.error(f"🔴 **{prod['Nome']}** - Estoque: {prod['Estoque_Atual']:.0f} (Mín: {prod['Estoque_Minimo']:.0f})")
+                            
+                            # Tenta enviar alerta por email se configurado
+                            try:
+                                config_alertas = carregar_config_alertas(spreadsheet)
+                                if config_alertas:
+                                    for config in config_alertas:
+                                        if config.get('Ativo') == 'Sim' and config.get('Email'):
+                                            df_criticos = pd.DataFrame(produtos_criticos)
+                                            enviar_alerta_email(config['Email'], df_criticos)
+                                            st.info(f"📧 Alerta enviado para {config['Email']}")
+                            except:
+                                pass  # Silenciosamente ignora erros de email
+                        
                         st.session_state.carrinho = []
-                        # Invalida cache de compras
+                        # Invalida caches
                         st.session_state.cache_key_compras += 1
+                        st.session_state.cache_key_produtos += 1
+                        if 'cache_key_movimentacoes' in st.session_state:
+                            st.session_state.cache_key_movimentacoes += 1
+                        
                         st.balloons()
-                        time.sleep(1.5)
+                        time.sleep(2)
                         st.rerun()
         else:
             st.info("🛒 Carrinho vazio. Adicione produtos!")
