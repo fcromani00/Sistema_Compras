@@ -1605,30 +1605,96 @@ def main():
     
     # Sidebar para navegação
     with st.sidebar:
-        st.image("https://img.icons8.com/fluency/96/shopping-cart.png", width=80)
-        st.title("Sistema de Compras")
-        st.markdown("---")
-        
-        pagina = st.radio(
-            "📌 Navegação",
-            ["🏠 Início", "📦 Produtos", "🛒 Nova Compra", "📦 Estoque", "📊 Histórico"],
-            label_visibility="collapsed"
-        )
+        # Logo e título
+        st.markdown("""
+        <div style="text-align: center; padding: 1rem 0;">
+            <img src="https://img.icons8.com/fluency/96/shopping-cart.png" width="70">
+            <h2 style="margin: 0.5rem 0 0 0; color: #e2e8f0;">Sistema de Compras</h2>
+        </div>
+        """, unsafe_allow_html=True)
         
         st.markdown("---")
-        st.markdown("### ⚙️ Configurações")
         
-        nome_planilha = st.text_input(
-            "Nome da Planilha",
-            value="Sistema_Compras",
-            help="Nome da planilha no Google Sheets"
-        )
+        # Menu de navegação bonito
+        st.markdown("##### 📌 Menu")
         
-        if st.button("🔄 Recarregar Dados"):
-            # Invalida todos os caches
-            st.session_state.cache_key_produtos += 1
-            st.session_state.cache_key_compras += 1
-            st.rerun()
+        # Inicializa página selecionada
+        if 'pagina_atual' not in st.session_state:
+            st.session_state.pagina_atual = "🏠 Início"
+        
+        # CSS para botões do menu
+        st.markdown("""
+        <style>
+            div[data-testid="stSidebar"] .stButton button {
+                width: 100%;
+                text-align: left;
+                padding: 0.75rem 1rem;
+                margin: 0.25rem 0;
+                border-radius: 10px;
+                border: none;
+                background: transparent;
+                color: #e2e8f0;
+                font-size: 1rem;
+                transition: all 0.3s ease;
+            }
+            div[data-testid="stSidebar"] .stButton button:hover {
+                background: rgba(255,255,255,0.1);
+                transform: translateX(5px);
+            }
+            div[data-testid="stSidebar"] .menu-ativo button {
+                background: linear-gradient(135deg, #2d5a87 0%, #1e3a5f 100%) !important;
+                box-shadow: 0 4px 12px rgba(45, 90, 135, 0.4);
+            }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Definição do menu
+        menu_items = [
+            ("🏠 Início", "home"),
+            ("📦 Produtos", "produtos"),
+            ("🛒 Nova Compra", "compra"),
+            ("📊 Estoque", "estoque"),
+            ("📈 Histórico", "historico")
+        ]
+        
+        # Botões do menu
+        for label, key in menu_items:
+            is_active = st.session_state.pagina_atual == label
+            
+            # Wrapper com classe para estilo ativo
+            if is_active:
+                st.markdown('<div class="menu-ativo">', unsafe_allow_html=True)
+            
+            if st.button(label, key=f"menu_{key}", use_container_width=True):
+                st.session_state.pagina_atual = label
+                st.rerun()
+            
+            if is_active:
+                st.markdown('</div>', unsafe_allow_html=True)
+        
+        pagina = st.session_state.pagina_atual
+        
+        st.markdown("---")
+        
+        # Configurações em expander
+        with st.expander("⚙️ Configurações", expanded=False):
+            nome_planilha = st.text_input(
+                "📋 Nome da Planilha",
+                value="Sistema_Compras",
+                help="Nome da planilha no Google Sheets"
+            )
+            
+            st.markdown("")
+            
+            if st.button("🔄 Recarregar Dados", use_container_width=True):
+                # Invalida todos os caches
+                st.session_state.cache_key_produtos += 1
+                st.session_state.cache_key_compras += 1
+                st.session_state.abas_verificadas = False
+                st.rerun()
+            
+            st.markdown("---")
+            st.caption("v1.0 - Sistema de Compras")
     
     # Tenta conectar
     client = conectar_gsheets()
@@ -1728,10 +1794,10 @@ def main():
     elif pagina == "🛒 Nova Compra":
         pagina_compras(spreadsheet)
     
-    elif pagina == "📦 Estoque":
+    elif pagina == "📊 Estoque":
         pagina_estoque(spreadsheet)
     
-    elif pagina == "📊 Histórico":
+    elif pagina == "📈 Histórico":
         pagina_historico(spreadsheet)
 
 
