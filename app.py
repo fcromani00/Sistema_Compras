@@ -6,6 +6,9 @@ from datetime import datetime, timedelta
 import time
 import json
 import io
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Configuração da página
 st.set_page_config(
@@ -245,7 +248,7 @@ def obter_planilha(_client, spreadsheet_name):
 
 
 def garantir_abas(spreadsheet):
-    """Garante que as abas Produtos e Compras existam com todas as colunas necessárias"""
+    """Garante que as abas Produtos, Compras e Movimentações existam com todas as colunas necessárias"""
     # Verifica se já foi executado nesta sessão
     if st.session_state.get('abas_verificadas', False):
         return spreadsheet
@@ -254,12 +257,12 @@ def garantir_abas(spreadsheet):
         worksheets = [ws.title for ws in spreadsheet.worksheets()]
         
         # ==================== ABA PRODUTOS ====================
-        # Colunas esperadas na aba Produtos
-        COLUNAS_PRODUTOS = ['ID', 'Nome', 'Categoria', 'Preço', 'Unidade', 'Imagem', 'Data_Cadastro']
+        # Colunas esperadas na aba Produtos (com estoque)
+        COLUNAS_PRODUTOS = ['ID', 'Nome', 'Categoria', 'Preço', 'Unidade', 'Estoque_Atual', 'Estoque_Minimo', 'Imagem', 'Data_Cadastro']
         
         if 'Produtos' not in worksheets:
             # Cria aba nova com todas as colunas
-            ws_produtos = spreadsheet.add_worksheet(title='Produtos', rows=1000, cols=10)
+            ws_produtos = spreadsheet.add_worksheet(title='Produtos', rows=1000, cols=15)
             ws_produtos.append_row(COLUNAS_PRODUTOS, value_input_option='RAW')
         else:
             # Verifica e adiciona colunas faltantes
@@ -302,6 +305,33 @@ def garantir_abas(spreadsheet):
                         ws_compras.update_cell(1, pos, coluna)
                         headers.append(coluna)
         
+        # ==================== ABA MOVIMENTAÇÕES (ESTOQUE) ====================
+        # Colunas para controle de entrada/saída de estoque
+        COLUNAS_MOVIMENTACOES = ['ID_Mov', 'Data', 'Tipo', 'Produto', 'Quantidade', 'Motivo', 'Observação']
+        
+        if 'Movimentacoes' not in worksheets:
+            ws_mov = spreadsheet.add_worksheet(title='Movimentacoes', rows=1000, cols=10)
+            ws_mov.append_row(COLUNAS_MOVIMENTACOES, value_input_option='RAW')
+        else:
+            ws_mov = spreadsheet.worksheet('Movimentacoes')
+            headers = ws_mov.row_values(1)
+            if not headers:
+                ws_mov.append_row(COLUNAS_MOVIMENTACOES, value_input_option='RAW')
+            else:
+                for coluna in COLUNAS_MOVIMENTACOES:
+                    if coluna not in headers:
+                        pos = len(headers) + 1
+                        ws_mov.update_cell(1, pos, coluna)
+                        headers.append(coluna)
+        
+        # ==================== ABA ALERTAS ====================
+        # Colunas para configuração de alertas
+        COLUNAS_ALERTAS = ['ID', 'Email', 'Ativo', 'Ultima_Verificacao']
+        
+        if 'Alertas_Config' not in worksheets:
+            ws_alertas = spreadsheet.add_worksheet(title='Alertas_Config', rows=100, cols=10)
+            ws_alertas.append_row(COLUNAS_ALERTAS, value_input_option='RAW')
+        
         # ==================== LIMPEZA ====================
         # Remove a Sheet1 padrão se existir e há outras abas
         if 'Sheet1' in worksheets and len(worksheets) > 1:
@@ -323,8 +353,8 @@ def garantir_abas(spreadsheet):
 @st.cache_data(ttl=300, show_spinner=False)
 def carregar_produtos(_spreadsheet, _cache_key):
     """Carrega todos os produtos da aba Produtos (com cache de 5 minutos)"""
-    # Colunas esperadas
-    COLUNAS_PRODUTOS = ['ID', 'Nome', 'Categoria', 'Preço', 'Unidade', 'Imagem', 'Data_Cadastro']
+    # Colunas esperadas (incluindo estoque)
+    COLUNAS_PRODUTOS = ['ID', 'Nome', 'Categoria', 'Preço', 'Unidade', 'Estoque_Atual', 'Estoque_Minimo', 'Imagem', 'Data_Cadastro']
     
     try:
         ws = _spreadsheet.worksheet('Produtos')
@@ -340,15 +370,20 @@ def carregar_produtos(_spreadsheet, _cache_key):
         # Garante que todas as colunas existam
         for col in COLUNAS_PRODUTOS:
             if col not in df.columns:
-                df[col] = ''
+                df[col] = 0 if col in ['Estoque_Atual', 'Estoque_Minimo'] else ''
         
-        # Garante que Preço seja numérico
+        # Garante que colunas numéricas sejam numéricas
         if 'Preço' in df.columns:
             df['Preço'] = pd.to_numeric(df['Preço'], errors='coerce').fillna(0)
         
-        # Garante que ID seja numérico
         if 'ID' in df.columns:
             df['ID'] = pd.to_numeric(df['ID'], errors='coerce').fillna(0).astype(int)
+        
+        if 'Estoque_Atual' in df.columns:
+            df['Estoque_Atual'] = pd.to_numeric(df['Estoque_Atual'], errors='coerce').fillna(0)
+        
+        if 'Estoque_Minimo' in df.columns:
+            df['Estoque_Minimo'] = pd.to_numeric(df['Estoque_Minimo'], errors='coerce').fillna(0)
         
         return df
     except Exception as e:
@@ -356,7 +391,7 @@ def carregar_produtos(_spreadsheet, _cache_key):
         return pd.DataFrame(columns=COLUNAS_PRODUTOS)
 
 
-def adicionar_produto(spreadsheet, nome, categoria, preco, unidade, imagem_url=""):
+def adicionar_produto(spreadsheet, nome, categoria, preco, unidade, estoque_atual=0, estoque_minimo=5, imagem_url=""):
     """Adiciona um novo produto com tratamento de erros"""
     try:
         ws = spreadsheet.worksheet('Produtos')
@@ -365,6 +400,8 @@ def adicionar_produto(spreadsheet, nome, categoria, preco, unidade, imagem_url="
         
         # Garante que preço seja float
         preco_float = float(preco) if preco else 0.0
+        estoque_atual_float = float(estoque_atual) if estoque_atual else 0.0
+        estoque_minimo_float = float(estoque_minimo) if estoque_minimo else 5.0
         
         # Garante que valores não sejam None
         nome = str(nome or "").strip()
@@ -379,6 +416,8 @@ def adicionar_produto(spreadsheet, nome, categoria, preco, unidade, imagem_url="
             categoria,
             preco_float,
             unidade,
+            estoque_atual_float,
+            estoque_minimo_float,
             imagem_url,
             datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         ], value_input_option='RAW')
@@ -457,6 +496,199 @@ def registrar_compra(spreadsheet, itens, metodo_pagamento, observacao=""):
         return None
 
 
+# ==================== FUNÇÕES DE ESTOQUE ====================
+
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_movimentacoes(_spreadsheet, _cache_key):
+    """Carrega todas as movimentações de estoque"""
+    COLUNAS_MOV = ['ID_Mov', 'Data', 'Tipo', 'Produto', 'Quantidade', 'Motivo', 'Observação']
+    
+    try:
+        ws = _spreadsheet.worksheet('Movimentacoes')
+        dados = ws.get_all_records(value_render_option='UNFORMATTED_VALUE')
+        
+        if dados:
+            df = pd.DataFrame(dados)
+        else:
+            df = pd.DataFrame(columns=COLUNAS_MOV)
+        
+        for col in COLUNAS_MOV:
+            if col not in df.columns:
+                df[col] = ''
+        
+        if 'Quantidade' in df.columns:
+            df['Quantidade'] = pd.to_numeric(df['Quantidade'], errors='coerce').fillna(0)
+        
+        return df
+    except:
+        return pd.DataFrame(columns=COLUNAS_MOV)
+
+
+def registrar_movimentacao(spreadsheet, tipo, produto, quantidade, motivo="", observacao=""):
+    """Registra uma movimentação de estoque (Entrada ou Saída)"""
+    try:
+        ws = spreadsheet.worksheet('Movimentacoes')
+        dados = ws.get_all_values()
+        id_mov = f"MOV{len(dados):05d}"
+        data_atual = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        ws.append_row([
+            id_mov,
+            data_atual,
+            tipo,  # "Entrada" ou "Saída"
+            str(produto),
+            float(quantidade),
+            str(motivo or ""),
+            str(observacao or "")
+        ], value_input_option='RAW')
+        
+        return id_mov
+    except Exception as e:
+        st.error(f"❌ Erro ao registrar movimentação: {e}")
+        return None
+
+
+def atualizar_estoque_produto(spreadsheet, nome_produto, nova_quantidade):
+    """Atualiza o estoque de um produto específico"""
+    try:
+        ws = spreadsheet.worksheet('Produtos')
+        dados = ws.get_all_records()
+        
+        # Encontra a linha do produto
+        for idx, row in enumerate(dados, start=2):  # start=2 porque linha 1 é cabeçalho
+            if row.get('Nome') == nome_produto:
+                # Encontra a coluna de Estoque_Atual
+                headers = ws.row_values(1)
+                if 'Estoque_Atual' in headers:
+                    col_idx = headers.index('Estoque_Atual') + 1
+                    ws.update_cell(idx, col_idx, float(nova_quantidade))
+                    return True
+        return False
+    except Exception as e:
+        st.error(f"❌ Erro ao atualizar estoque: {e}")
+        return False
+
+
+def obter_produtos_estoque_critico(df_produtos):
+    """Retorna produtos com estoque abaixo do mínimo"""
+    if df_produtos.empty:
+        return pd.DataFrame()
+    
+    if 'Estoque_Atual' not in df_produtos.columns or 'Estoque_Minimo' not in df_produtos.columns:
+        return pd.DataFrame()
+    
+    # Filtra produtos com estoque crítico
+    criticos = df_produtos[df_produtos['Estoque_Atual'] <= df_produtos['Estoque_Minimo']].copy()
+    
+    if not criticos.empty:
+        criticos['Deficit'] = criticos['Estoque_Minimo'] - criticos['Estoque_Atual']
+    
+    return criticos
+
+
+def enviar_alerta_email(destinatario, produtos_criticos, config_email=None):
+    """Envia alerta por email sobre produtos com estoque crítico"""
+    try:
+        # Configurações de email (pode vir do secrets)
+        if config_email is None:
+            if "email_config" in st.secrets:
+                config_email = dict(st.secrets["email_config"])
+            else:
+                return False, "Configuração de email não encontrada"
+        
+        smtp_server = config_email.get('smtp_server', 'smtp.gmail.com')
+        smtp_port = config_email.get('smtp_port', 587)
+        email_sender = config_email.get('email_sender', '')
+        email_password = config_email.get('email_password', '')
+        
+        if not email_sender or not email_password:
+            return False, "Credenciais de email não configuradas"
+        
+        # Monta o corpo do email
+        html_produtos = ""
+        for _, prod in produtos_criticos.iterrows():
+            html_produtos += f"""
+            <tr>
+                <td style="padding: 8px; border: 1px solid #ddd;">{prod.get('Nome', 'N/A')}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">{prod.get('Estoque_Atual', 0)}</td>
+                <td style="padding: 8px; border: 1px solid #ddd; text-align: center;">{prod.get('Estoque_Minimo', 0)}</td>
+            </tr>
+            """
+        
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <div style="background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); color: white; padding: 20px; border-radius: 10px;">
+                <h1>⚠️ Alerta de Estoque Crítico</h1>
+                <p>Os seguintes produtos estão com estoque abaixo do nível mínimo:</p>
+            </div>
+            <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+                <thead>
+                    <tr style="background-color: #1e3a5f; color: white;">
+                        <th style="padding: 10px; border: 1px solid #ddd;">Produto</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Estoque Atual</th>
+                        <th style="padding: 10px; border: 1px solid #ddd;">Estoque Mínimo</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {html_produtos}
+                </tbody>
+            </table>
+            <p style="margin-top: 20px; color: #666;">
+                Este é um alerta automático do Sistema de Compras.<br>
+                Data/Hora: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}
+            </p>
+        </body>
+        </html>
+        """
+        
+        # Cria a mensagem
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"⚠️ ALERTA: {len(produtos_criticos)} produto(s) com estoque crítico"
+        msg['From'] = email_sender
+        msg['To'] = destinatario
+        
+        msg.attach(MIMEText(html_body, 'html'))
+        
+        # Envia o email
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(email_sender, email_password)
+            server.sendmail(email_sender, destinatario, msg.as_string())
+        
+        return True, "Email enviado com sucesso!"
+    except Exception as e:
+        return False, f"Erro ao enviar email: {e}"
+
+
+def carregar_config_alertas(spreadsheet):
+    """Carrega configurações de alertas"""
+    try:
+        ws = spreadsheet.worksheet('Alertas_Config')
+        dados = ws.get_all_records()
+        return dados
+    except:
+        return []
+
+
+def salvar_config_alerta(spreadsheet, email, ativo=True):
+    """Salva configuração de alerta"""
+    try:
+        ws = spreadsheet.worksheet('Alertas_Config')
+        dados = ws.get_all_values()
+        novo_id = len(dados)
+        
+        ws.append_row([
+            novo_id,
+            email,
+            "Sim" if ativo else "Não",
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        ], value_input_option='RAW')
+        return True
+    except:
+        return False
+
+
 # ==================== INTERFACE STREAMLIT ====================
 
 def mostrar_config():
@@ -531,6 +763,16 @@ def pagina_produtos(spreadsheet):
             )
             preco = st.number_input("Preço (R$)", min_value=0.01, step=0.01, format="%.2f")
             unidade = st.selectbox("Unidade", ["un", "kg", "L", "cx", "pct"])
+            
+            # Campos de estoque
+            st.markdown("##### 📦 Estoque")
+            col_est1, col_est2 = st.columns(2)
+            with col_est1:
+                estoque_atual = st.number_input("Estoque Inicial", min_value=0.0, step=1.0, format="%.1f", value=0.0)
+            with col_est2:
+                estoque_minimo = st.number_input("Estoque Mínimo", min_value=0.0, step=1.0, format="%.1f", value=5.0,
+                                                  help="Alerta quando estoque ficar abaixo deste valor")
+            
             imagem_url = st.text_input(
                 "🖼️ URL da Imagem (opcional)",
                 placeholder="https://exemplo.com/imagem.jpg",
@@ -545,7 +787,7 @@ def pagina_produtos(spreadsheet):
             
             if submitted:
                 if nome:
-                    sucesso = adicionar_produto(spreadsheet, nome, categoria, preco, unidade, imagem_url)
+                    sucesso = adicionar_produto(spreadsheet, nome, categoria, preco, unidade, estoque_atual, estoque_minimo, imagem_url)
                     if sucesso:
                         st.success(f"✅ Produto '{nome}' adicionado com sucesso!")
                         # Invalida cache de produtos
@@ -570,6 +812,11 @@ def pagina_produtos(spreadsheet):
             else:
                 df_filtrado = df_produtos
             
+            # Verifica produtos com estoque crítico
+            produtos_criticos = obter_produtos_estoque_critico(df_filtrado)
+            if not produtos_criticos.empty:
+                st.warning(f"⚠️ **{len(produtos_criticos)} produto(s) com estoque crítico!**")
+            
             # Configuração das colunas (só inclui as que existem no DataFrame)
             column_config = {}
             
@@ -583,6 +830,10 @@ def pagina_produtos(spreadsheet):
                 column_config["Preço"] = st.column_config.NumberColumn("Preço", format="R$ %.2f")
             if 'Unidade' in df_filtrado.columns:
                 column_config["Unidade"] = st.column_config.TextColumn("Un.", width="small")
+            if 'Estoque_Atual' in df_filtrado.columns:
+                column_config["Estoque_Atual"] = st.column_config.NumberColumn("📦 Estoque", format="%.1f")
+            if 'Estoque_Minimo' in df_filtrado.columns:
+                column_config["Estoque_Minimo"] = st.column_config.NumberColumn("⚠️ Mín.", format="%.1f")
             if 'Imagem' in df_filtrado.columns:
                 column_config["Imagem"] = st.column_config.ImageColumn("📷", width="small")
             if 'Data_Cadastro' in df_filtrado.columns:
@@ -1019,6 +1270,266 @@ def pagina_historico(spreadsheet):
         st.info("📭 Nenhuma compra registrada ainda.")
 
 
+def pagina_estoque(spreadsheet):
+    """Página de controle de estoque"""
+    st.markdown("""
+    <div class="main-header">
+        <h1>📦 Controle de Estoque</h1>
+        <p>Gerencie entradas, saídas e alertas de reposição</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Inicializa cache key de movimentações
+    if 'cache_key_movimentacoes' not in st.session_state:
+        st.session_state.cache_key_movimentacoes = 0
+    
+    df_produtos = carregar_produtos(spreadsheet, st.session_state.cache_key_produtos)
+    
+    if df_produtos.empty:
+        st.warning("⚠️ Cadastre produtos primeiro na aba 'Produtos'!")
+        return
+    
+    # ==================== ALERTAS DE ESTOQUE CRÍTICO ====================
+    produtos_criticos = obter_produtos_estoque_critico(df_produtos)
+    
+    if not produtos_criticos.empty:
+        st.markdown("### 🚨 Produtos com Estoque Crítico")
+        
+        for _, prod in produtos_criticos.iterrows():
+            col1, col2, col3, col4 = st.columns([3, 1, 1, 2])
+            with col1:
+                st.markdown(f"**{prod.get('Nome', 'N/A')}**")
+            with col2:
+                st.markdown(f"📦 Atual: **{prod.get('Estoque_Atual', 0):.0f}**")
+            with col3:
+                st.markdown(f"⚠️ Mín: **{prod.get('Estoque_Minimo', 0):.0f}**")
+            with col4:
+                deficit = prod.get('Estoque_Minimo', 0) - prod.get('Estoque_Atual', 0)
+                st.error(f"Repor: **{max(0, deficit):.0f}** unidades")
+        
+        st.markdown("---")
+    else:
+        st.success("✅ Todos os produtos estão com estoque adequado!")
+        st.markdown("---")
+    
+    # ==================== TABS ====================
+    tab1, tab2, tab3 = st.tabs(["📊 Visão Geral", "📥 Movimentações", "⚙️ Configurar Alertas"])
+    
+    with tab1:
+        # Métricas gerais
+        col1, col2, col3, col4 = st.columns(4)
+        
+        total_produtos = len(df_produtos)
+        total_criticos = len(produtos_criticos)
+        total_estoque = df_produtos['Estoque_Atual'].sum() if 'Estoque_Atual' in df_produtos.columns else 0
+        valor_estoque = (df_produtos['Estoque_Atual'] * df_produtos['Preço']).sum() if 'Estoque_Atual' in df_produtos.columns else 0
+        
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">Total de Produtos</div>
+                <div class="metric-value">{total_produtos}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            cor_critico = "#dc2626" if total_criticos > 0 else "#22c55e"
+            st.markdown(f"""
+            <div class="metric-card" style="border-left-color: {cor_critico};">
+                <div class="metric-label">🚨 Estoque Crítico</div>
+                <div class="metric-value" style="color: {cor_critico};">{total_criticos}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">📦 Itens em Estoque</div>
+                <div class="metric-value">{total_estoque:.0f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col4:
+            st.markdown(f"""
+            <div class="metric-card" style="border-left-color: #22c55e;">
+                <div class="metric-label">💰 Valor do Estoque</div>
+                <div class="metric-value" style="color: #22c55e;">R$ {valor_estoque:.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        st.markdown("### 📋 Estoque por Produto")
+        
+        # Tabela de estoque
+        if not df_produtos.empty:
+            df_estoque = df_produtos[['Nome', 'Categoria', 'Estoque_Atual', 'Estoque_Minimo', 'Preço']].copy()
+            df_estoque['Valor_Total'] = df_estoque['Estoque_Atual'] * df_estoque['Preço']
+            df_estoque['Status'] = df_estoque.apply(
+                lambda x: '🔴 Crítico' if x['Estoque_Atual'] <= x['Estoque_Minimo'] else '🟢 OK', 
+                axis=1
+            )
+            
+            st.dataframe(
+                df_estoque,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Nome": st.column_config.TextColumn("Produto"),
+                    "Categoria": st.column_config.TextColumn("Categoria"),
+                    "Estoque_Atual": st.column_config.NumberColumn("📦 Atual", format="%.0f"),
+                    "Estoque_Minimo": st.column_config.NumberColumn("⚠️ Mínimo", format="%.0f"),
+                    "Preço": st.column_config.NumberColumn("Preço Un.", format="R$ %.2f"),
+                    "Valor_Total": st.column_config.NumberColumn("💰 Valor Total", format="R$ %.2f"),
+                    "Status": st.column_config.TextColumn("Status")
+                }
+            )
+    
+    with tab2:
+        st.markdown("### 📥 Registrar Movimentação de Estoque")
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            with st.form("form_movimentacao", clear_on_submit=True):
+                tipo_mov = st.selectbox(
+                    "Tipo de Movimentação",
+                    ["Entrada", "Saída"],
+                    help="Entrada: aumenta estoque | Saída: diminui estoque"
+                )
+                
+                opcoes_produtos = [nome for nome in df_produtos['Nome'].tolist() if nome and str(nome).strip()]
+                produto_mov = st.selectbox("Produto", opcoes_produtos)
+                
+                quantidade_mov = st.number_input(
+                    "Quantidade", 
+                    min_value=0.1, 
+                    step=1.0, 
+                    format="%.1f"
+                )
+                
+                motivos_entrada = ["Compra de fornecedor", "Devolução", "Ajuste de inventário", "Produção", "Outro"]
+                motivos_saida = ["Venda", "Perda/Avaria", "Vencimento", "Ajuste de inventário", "Consumo interno", "Outro"]
+                
+                motivo_mov = st.selectbox(
+                    "Motivo",
+                    motivos_entrada if tipo_mov == "Entrada" else motivos_saida
+                )
+                
+                obs_mov = st.text_input("Observação (opcional)")
+                
+                submitted_mov = st.form_submit_button(
+                    f"{'📥 Registrar Entrada' if tipo_mov == 'Entrada' else '📤 Registrar Saída'}", 
+                    use_container_width=True
+                )
+                
+                if submitted_mov:
+                    # Busca estoque atual do produto
+                    estoque_atual = df_produtos[df_produtos['Nome'] == produto_mov]['Estoque_Atual'].values[0]
+                    
+                    # Calcula novo estoque
+                    if tipo_mov == "Entrada":
+                        novo_estoque = estoque_atual + quantidade_mov
+                    else:
+                        if quantidade_mov > estoque_atual:
+                            st.error(f"❌ Quantidade maior que o estoque disponível ({estoque_atual:.0f})")
+                        else:
+                            novo_estoque = estoque_atual - quantidade_mov
+                    
+                    if tipo_mov == "Entrada" or quantidade_mov <= estoque_atual:
+                        # Registra movimentação
+                        id_mov = registrar_movimentacao(spreadsheet, tipo_mov, produto_mov, quantidade_mov, motivo_mov, obs_mov)
+                        
+                        if id_mov:
+                            # Atualiza estoque do produto
+                            if atualizar_estoque_produto(spreadsheet, produto_mov, novo_estoque):
+                                st.success(f"✅ {tipo_mov} registrada! Novo estoque de '{produto_mov}': {novo_estoque:.0f}")
+                                st.session_state.cache_key_produtos += 1
+                                st.session_state.cache_key_movimentacoes += 1
+                                time.sleep(1)
+                                st.rerun()
+        
+        with col2:
+            st.markdown("### 📜 Últimas Movimentações")
+            
+            df_mov = carregar_movimentacoes(spreadsheet, st.session_state.cache_key_movimentacoes)
+            
+            if not df_mov.empty:
+                # Mostra últimas 10 movimentações
+                df_ultimas = df_mov.tail(10).iloc[::-1]  # Inverte para mostrar mais recentes primeiro
+                
+                st.dataframe(
+                    df_ultimas,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "ID_Mov": st.column_config.TextColumn("ID", width="small"),
+                        "Data": st.column_config.TextColumn("Data"),
+                        "Tipo": st.column_config.TextColumn("Tipo"),
+                        "Produto": st.column_config.TextColumn("Produto"),
+                        "Quantidade": st.column_config.NumberColumn("Qtd", format="%.0f"),
+                        "Motivo": st.column_config.TextColumn("Motivo")
+                    }
+                )
+            else:
+                st.info("📭 Nenhuma movimentação registrada ainda.")
+    
+    with tab3:
+        st.markdown("### ⚙️ Configurar Alertas por Email")
+        
+        st.info("""
+        📧 **Configure alertas automáticos** para receber notificações quando produtos 
+        atingirem o estoque crítico.
+        """)
+        
+        # Configuração de email
+        with st.expander("📨 Configurar Email de Alerta", expanded=True):
+            email_destinatario = st.text_input(
+                "Email para receber alertas",
+                placeholder="seu-email@exemplo.com"
+            )
+            
+            col_btn1, col_btn2 = st.columns(2)
+            
+            with col_btn1:
+                if st.button("🔔 Testar Alerta", use_container_width=True, disabled=not email_destinatario):
+                    if not produtos_criticos.empty:
+                        with st.spinner("Enviando email de teste..."):
+                            sucesso, msg = enviar_alerta_email(email_destinatario, produtos_criticos)
+                            if sucesso:
+                                st.success(f"✅ {msg}")
+                            else:
+                                st.error(f"❌ {msg}")
+                    else:
+                        st.warning("Não há produtos com estoque crítico para enviar alerta.")
+            
+            with col_btn2:
+                if st.button("💾 Salvar Configuração", use_container_width=True, disabled=not email_destinatario):
+                    if salvar_config_alerta(spreadsheet, email_destinatario):
+                        st.success("✅ Configuração salva!")
+                    else:
+                        st.error("❌ Erro ao salvar configuração")
+        
+        st.markdown("---")
+        
+        st.markdown("""
+        ### 📋 Como configurar o envio de emails
+        
+        Para que os alertas funcionem, adicione ao seu `secrets.toml` ou no Streamlit Cloud:
+        
+        ```toml
+        [email_config]
+        smtp_server = "smtp.gmail.com"
+        smtp_port = 587
+        email_sender = "seu-email@gmail.com"
+        email_password = "sua-senha-de-app"
+        ```
+        
+        **⚠️ Para Gmail:**
+        1. Ative a verificação em duas etapas
+        2. Crie uma "Senha de App" em [myaccount.google.com](https://myaccount.google.com/apppasswords)
+        3. Use essa senha no campo `email_password`
+        """)
+
+
 # ==================== MAIN ====================
 
 def main():
@@ -1036,7 +1547,7 @@ def main():
         
         pagina = st.radio(
             "📌 Navegação",
-            ["🏠 Início", "📦 Produtos", "🛒 Nova Compra", "📊 Histórico"],
+            ["🏠 Início", "📦 Produtos", "🛒 Nova Compra", "📦 Estoque", "📊 Histórico"],
             label_visibility="collapsed"
         )
         
@@ -1152,6 +1663,9 @@ def main():
     
     elif pagina == "🛒 Nova Compra":
         pagina_compras(spreadsheet)
+    
+    elif pagina == "📦 Estoque":
+        pagina_estoque(spreadsheet)
     
     elif pagina == "📊 Histórico":
         pagina_historico(spreadsheet)
