@@ -1,0 +1,48 @@
+# ============================================
+# CREDENCIAIS - NUNCA COMMITTAR!
+# ============================================
+credentials.json
+**/credentials*.json
+service_account*.json
+
+# ============================================
+# PYTHON
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# ============================================
+# IDE
+# ============================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-*
+
+# ============================================
+# OS
+# ============================================
+.DS_Store
+Thumbs.db
+*.log
+
+# ============================================
+# STREAMLIT
+# ============================================
+# Secrets locais (NUNCA COMMITTAR!)
+.streamlit/secrets.toml
+
+# NÃO ignorar config.toml (pode ser commitado)
+# !.streamlit/config.toml
+

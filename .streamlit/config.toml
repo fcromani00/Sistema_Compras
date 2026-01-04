@@ -1,0 +1,27 @@
+[theme]
+# Tema personalizado para o Sistema de Compras
+primaryColor = "#2d5a87"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f8fafc"
+textColor = "#1e3a5f"
+font = "sans serif"
+
+[server]
+# Configurações do servidor
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+# Configurações do navegador
+gatherUsageStats = false
+
+[runner]
+# Permite rerun automático
+fastReruns = true
+
+[client]
+# Configurações do cliente
+showErrorDetails = false
+toolbarMode = "minimal"
+
